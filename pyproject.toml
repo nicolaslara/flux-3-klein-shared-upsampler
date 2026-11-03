@@ -1,0 +1,9 @@
+[project]
+name = "flux3-klein-shared-upsampler"
+version = "0.1.0"
+description = "FLUX.3 Klein on Modal: image workers behind one shared prompt upsampler"
+requires-python = ">=3.12"
+dependencies = ["modal>=1.6.3"]
+
+[tool.ruff]
+line-length = 110
