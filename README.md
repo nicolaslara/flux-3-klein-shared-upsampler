@@ -56,7 +56,7 @@ uv run python client.py $URL "Two blue mugs on a wooden table by a window" --see
 | `guidance` | 3.5 on Base | 0 to 20. Not used by Distilled |
 | `output_format` | `jpeg` | `jpeg` (quality 95) or `png` |
 
-The response is the picture. `X-Pup-Ms` is the expansion time seen by the worker and `X-Upsampler-Ms` the part spent inside the upsampler (the difference is the hop between the two), `X-Image-Ms` the generation time, `X-Caption` the expanded caption, URL-encoded. 422 is an invalid request (the body says what), 429 a worker that already holds 16 requests (retry), 502 an engine failure, 503 no worker up, a worker being replaced, or the upsampler unreachable, 504 the 300 s deadline.
+The response is the picture; `X-Pup-Ms`, `X-Upsampler-Ms` and `X-Image-Ms` headers give the expansion time seen by the worker, the part spent inside the upsampler, and the generation time; `X-Caption` is the expanded caption, URL-encoded. 422 is an invalid request (the body says what), 429 a worker that already holds 16 requests (retry), 502 an engine failure, 503 no worker up or the upsampler unreachable, 504 the 300 s deadline.
 
 Editing: the reference pictures go base64-encoded in `images`. The body is too large for a command-line argument, so write it to a file:
 
@@ -79,13 +79,13 @@ A worker stops 120 s after its last request, and the next request starts one: ab
 uv run modal run worker.py --warm 1
 ```
 
-A worker holds up to 16 requests, sends up to four of them to the upsampler at once and renders one picture at a time while the next one's encoding overlaps. Beyond 16, Modal queues and adds workers, up to `REPLICAS`. One upsampler fed three workers at 3.75 pictures per second without reaching its limit; its expansion time rose from 1.3 s to 1.7 s.
+A worker holds up to 16 requests and renders one picture at a time while the next one's encoding overlaps. Beyond 16, Modal queues and adds workers, up to `REPLICAS`. One upsampler fed three workers at 3.75 pictures per second without reaching its limit.
 
 ## Configuration
 
 Environment variables read at deploy time, for example `MODEL=base REPLICAS=4 uv run modal deploy worker.py`. A redeploy with the same code and settings keeps the snapshot; changing either makes the next start a fresh one.
 
-`upsampler.py` reads `GPU` (`B200`; an H200 costs $1.70 per hour less and adds 0.4 s per expansion), `REGION` (unset; set it to the same value on both apps, an unpinned pair pays about 0.1 s more per picture on the hop) and `APP_NAME` (`flux3-upsampler`).
+`upsampler.py` reads `GPU` (`B200`; H200 costs $1.70 per hour less and adds 0.4 s per expansion), `REGION` (unset; use the same value on both apps, an unpinned pair pays about 0.1 s more per picture) and `APP_NAME` (`flux3-upsampler`).
 
 `worker.py`:
 
@@ -115,6 +115,4 @@ Distilled FP8R, 1024x1024 JPEG, unique prompts, upsampler and workers in `us-eas
 | 2 workers | 3.0 | 2.78 | 4.2 / 7.1 s | 2.06 |
 | 3 workers | 4.0 | 3.75 | 3.1 / 5.0 s | 2.04 |
 
-The same three B200 as three one-container replicas deliver at most 1.8 pictures per second, at p50 3.1 s and p95 5.2 s for 1.6 per second offered, because each replica's upsampler and image engine compete for the GPU. In a three-minute burst from zero at 1.5 requests per second, the first picture came after 17 s here and after 35 s with one container per replica.
-
-Cold starts, wake to first picture, medians of five probes: 17 s with a snapshot, 230 s without.
+Three one-container replicas on the same three B200 deliver at most 1.8 pictures per second (p50 3.1 s, p95 5.2 s at 1.6 offered), because each replica's upsampler and image engine compete for the GPU. In a burst from zero at 1.5 requests per second, the first picture came after 17 s here and after 35 s with one container per replica. Cold starts, wake to first picture, medians of five probes: 17 s with a snapshot, 230 s without.
