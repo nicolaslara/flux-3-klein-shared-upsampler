@@ -178,6 +178,10 @@ class Upsampler:
         }
 
     @modal.method()
+    def system_prompts(self) -> dict:
+        return self.system_prompts
+
+    @modal.method()
     def health(self) -> dict:
         return {
             "task_id": self.task_id,
