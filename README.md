@@ -19,16 +19,21 @@ flowchart LR
 
 A worker is a Modal server for one model: it holds the text encoder, the FP8R transformer and the autoencoder (SGLang) on one B200, receives requests, sends the prompt to the upsampler, renders the picture and answers. It stops when idle and restores from a GPU memory snapshot. The upsampler is a Modal class running vLLM on one B200 that stays up; workers call it through the Modal SDK, about 40 ms per call. Captions skip it.
 
-Use this layout for more than about 0.5 pictures per second, or for several models. For one quiet endpoint, [flux-3-klein-serving](https://github.com/nicolaslara/flux-3-klein-serving) (upsampler and image engine in one container per replica) is cheaper, because the upsampler here costs $6.70 per hour even with no worker up.
+## Against one container per replica
 
-| Distilled, 1024x1024 | |
-|---|---|
-| Per picture, warm | 2.2 s |
-| Pictures per minute on one worker | 76 (p50 2.8 s, p95 4.1 s) |
-| Most pictures per second on three B200 | 2.8, against 1.8 with one container per replica |
-| Cold start of a worker with a snapshot, to the first picture | 17 s |
-| Cold start without one (first start after a deploy) | 4 min |
-| Kept warm, per hour | $6.70 upsampler, $6.95 per worker |
+The alternative, [flux-3-klein-serving](https://github.com/nicolaslara/flux-3-klein-serving), runs the upsampler and the image engine together on every B200. Distilled, 1024x1024, measured on the same day:
+
+| | One container per replica | Shared upsampler |
+|---|---|---|
+| Per picture, warm, one client | 2.0 s | 2.2 s |
+| Cold start with a snapshot, to the first picture | 33 s | 17 s |
+| Cold start without a snapshot | 9 min | 4 min |
+| Burst from zero at 1.5 requests per second, first picture | 35 s | 17 s |
+| Most pictures per second on three B200 | 1.8 | 2.8 |
+| $ per 1,000 pictures at that load | 3.20 | 2.06 |
+| Kept warm, per hour | $6.95 per container | $6.70 upsampler + $6.95 per worker |
+
+Cold starts are shorter because a worker's snapshot holds only the image engine, and the burst recovers faster for the same reason. Pictures per GPU go up because the upsampler no longer competes with the transformer for the GPU: a worker renders 1.5 pictures per second against 0.7 for a container doing both. The upsampler is a fixed $6.70 per hour, so with one worker the two layouts cost about the same per picture, and every further worker costs a third less. For one quiet endpoint, one container per replica is cheaper.
 
 `upsampler.py` is the upsampler service, `worker.py` the worker (configuration, image build, container start, Modal server), `flux3_api.py` the request handling, `requirements-pup.txt` the upsampler's locked environment.
 
