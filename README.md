@@ -4,23 +4,30 @@
 
 ## Architecture
 
+Two kinds of Modal apps:
+
+- The **prompt upsampler**: Black Forest Labs' 9B language model that turns a short prompt into the detailed caption the image model was trained on. One app, one B200, always up, used by every worker.
+- A **worker** per model (Distilled, Base, or Base with a LoRA): the image model itself, one app, one B200 per container. A worker starts on the first request, stops after 120 s idle, and comes back from a GPU memory snapshot.
+
 ```mermaid
-flowchart TB
-    C["Client"] -->|"POST /generate"| W
-    subgraph W["Worker: one Modal app per model (Distilled, Base, Base + LoRA), one B200, scales to zero"]
-        direction LR
-        S1["1 prompt to the upsampler"] --> S2["2 text encoder"] --> S3["3 transformer, 16 or 50 steps"] --> S4["4 autoencoder, picture"]
-    end
-    S1 <-->|"prompt out, caption back"| U["Upsampler service: one Modal app, one B200, always up, shared by every worker"]
+sequenceDiagram
+    participant C as Client
+    participant W as Worker (one per model, B200, starts on demand)
+    participant U as Prompt upsampler (one for all workers, B200, always up)
+    C->>W: POST /generate, prompt
+    W->>U: prompt
+    U-->>W: caption
+    Note over W: text encoder, transformer, autoencoder
+    W-->>C: picture
 ```
 
-A worker is a Modal server for one model: it holds the text encoder, the FP8R transformer and the autoencoder (SGLang) on one B200. For each request it first sends the prompt to the upsampler and waits for the caption, then renders the picture from that caption and answers. It stops when idle and restores from a GPU memory snapshot. The upsampler is a Modal class running vLLM on one B200 that stays up; workers call it through the Modal SDK, about 40 ms per call. Requests that supply a `caption` skip it.
+The prompt upsampler is called once per request, before rendering: about 1.3 s for the caption, then 0.7 s (Distilled) or 3.3 s (Base) for the picture. A request that already carries a `caption` skips it.
 
 ## Against one container per replica
 
-The alternative, [flux-3-klein-serving](https://github.com/nicolaslara/flux-3-klein-serving), runs the upsampler and the image engine together on every B200. Distilled, 1024x1024, measured on the same day:
+The alternative, [flux-3-klein-serving](https://github.com/nicolaslara/flux-3-klein-serving), runs the prompt upsampler and the image model together on every B200. Distilled, 1024x1024, measured on the same day:
 
-| | One container per replica | Shared upsampler |
+| | One container per replica | Shared prompt upsampler |
 |---|---|---|
 | Per picture, warm, one client | 2.0 s | 2.2 s |
 | Cold start with a snapshot, to the first picture | 33 s | 17 s |
@@ -28,15 +35,15 @@ The alternative, [flux-3-klein-serving](https://github.com/nicolaslara/flux-3-kl
 | Burst from zero at 1.5 requests per second, first picture | 35 s | 17 s |
 | Most pictures per second on three B200 | 1.8 | 2.8 |
 | $ per 1,000 pictures at that rate | 3.20 | 2.06 |
-| Kept warm, per hour | $6.95 per container | $6.70 upsampler + $6.95 per worker |
+| Kept warm, per hour | $6.95 per container | $6.70 prompt upsampler + $6.95 per worker |
 
-Cold starts are shorter because a worker's snapshot holds only the image engine, and the burst recovers faster for the same reason. Pictures per GPU go up because the upsampler no longer competes with the transformer for the GPU: a worker renders 1.5 pictures per second against 0.7 for a container doing both. The upsampler is a fixed $6.70 per hour, so with one worker the two layouts cost about the same per picture, and every further worker costs a third less. For one quiet endpoint, one container per replica is cheaper.
+Cold starts are shorter because a worker's snapshot holds only the image model. Pictures per GPU go up because the prompt upsampler no longer competes with the transformer for the GPU: a worker renders 1.5 pictures per second against 0.7 for a container doing both. The prompt upsampler is a fixed $6.70 per hour, so with one worker the two layouts cost about the same per picture, and every further worker costs a third less. For one quiet endpoint, one container per replica is cheaper.
 
-`upsampler.py` is the upsampler service, `worker.py` the worker (configuration, image build, container start, Modal server), `flux3_api.py` the request handling, `requirements-pup.txt` the upsampler's locked environment.
+`upsampler.py` is the prompt upsampler, `worker.py` the worker (configuration, image build, container start, Modal server), `flux3_api.py` the request handling, `requirements-pup.txt` the upsampler's locked environment.
 
 ## Quick start
 
-Accept the terms on Hugging Face for the model and the prompt upsampler, then deploy the upsampler first (a worker's first start calls it):
+Accept the terms on Hugging Face for the model and the prompt upsampler, then deploy the prompt upsampler first (a worker's first start calls it):
 
 ```
 uv sync
@@ -63,7 +70,7 @@ curl -sf -H "Modal-Key: $MODAL_KEY" -H "Modal-Secret: $MODAL_SECRET" \
   $URL/generate -o image.jpg
 ```
 
-Check the upsampler with `uv run python -c "import modal; print(modal.Cls.from_name('flux3-upsampler', 'Upsampler')().health.remote())"`.
+Check the prompt upsampler with `uv run python -c "import modal; print(modal.Cls.from_name('flux3-upsampler', 'Upsampler')().health.remote())"`.
 
 ## API
 
@@ -71,7 +78,7 @@ Check the upsampler with `uv run python -c "import modal; print(modal.Cls.from_n
 
 | field | default | notes |
 |---|---|---|
-| `prompt` | | Expanded by the upsampler. Exactly one of `prompt` and `caption` |
+| `prompt` | | Expanded by the prompt upsampler. Exactly one of `prompt` and `caption` |
 | `caption` | | An already expanded caption, used as is |
 | `images` | `[]` | Up to ten base64-encoded reference images, each up to 10 MB |
 | `width`, `height` | 1024, or the first reference's size | Multiples of 16, up to 4096 per side and 4 megapixels |
@@ -80,7 +87,7 @@ Check the upsampler with `uv run python -c "import modal; print(modal.Cls.from_n
 | `guidance` | 3.5 on Base | 0 to 20. Not used by Distilled |
 | `output_format` | `jpeg` | `jpeg` (quality 95) or `png` |
 
-The response is the picture; `X-Pup-Ms`, `X-Upsampler-Ms` and `X-Image-Ms` give the expansion time, its part inside the upsampler, and the generation time; `X-Caption` is the caption, URL-encoded. 422 is an invalid request, 429 a worker holding 16 requests (retry), 502 an engine failure, 503 no worker up, 504 the 300 s deadline.
+The response is the picture; `X-Pup-Ms`, `X-Upsampler-Ms` and `X-Image-Ms` give the prompt expansion time, its part inside the prompt upsampler, and the picture generation time; `X-Caption` is the caption, URL-encoded. 422 is an invalid request, 429 a worker holding 16 requests (retry), 502 an engine failure, 503 no worker up, 504 the 300 s deadline.
 
 Editing: the reference pictures go base64-encoded in `images`; write the body to a file:
 
@@ -93,7 +100,7 @@ Layouts: end the prompt with a JSON list of boxes, `[y_min, x_min, y_max, x_max]
 
 ## Cold starts and scaling
 
-A worker stops 120 s after its last request; the next request starts one, 17 s with a snapshot, four minutes without. The upsampler stays up. `uv run modal run worker.py --warm 1` keeps a worker up. A worker holds 16 requests and renders one at a time; beyond that Modal queues and adds workers, up to `REPLICAS`. One upsampler fed three workers at 3.75 pictures per second without reaching its limit.
+A worker stops 120 s after its last request; the next request starts one, 17 s with a snapshot, four minutes without. The prompt upsampler stays up. `uv run modal run worker.py --warm 1` keeps a worker up. A worker holds 16 requests and renders one at a time; beyond that Modal queues and adds workers, up to `REPLICAS`. One prompt upsampler fed three workers at 3.75 pictures per second without reaching its limit.
 
 ## Configuration
 
@@ -113,8 +120,8 @@ Environment variables read at deploy time, for example `MODEL=base REPLICAS=4 uv
 | `IDLE_SECONDS` | `120` | How long an idle worker stays up |
 | `SNAPSHOT` | `1` | `0` makes every start fresh |
 | `HIGH_RES` | `0` | Distilled on B200 only: text to image up to 6256 per side |
-| `UPSAMPLER_APP` | `flux3-upsampler` | The upsampler app, same environment |
-| `REGION` | unset | Match the upsampler; an unpinned pair pays about 0.1 s more per picture |
+| `UPSAMPLER_APP` | `flux3-upsampler` | The prompt upsampler app, same environment |
+| `REGION` | unset | Match the prompt upsampler; an unpinned pair pays about 0.1 s more per picture |
 | `MAX_INFLIGHT` | `16` | Requests a worker holds before answering 429 |
 | `IMAGE_SLOTS` | `2` | Requests at the image engine at once |
 
@@ -128,4 +135,4 @@ Distilled, 1024x1024, unique prompts, everything in `us-east`. Requests arrive i
 | 2 workers | 3.0 | 2.78 | 4.2 / 7.1 s | 2.06 |
 | 3 workers | 4.0 | 3.75 | 3.1 / 5.0 s | 2.04 |
 
-Three one-container replicas on the same three B200 deliver at most 1.8 pictures per second (p50 3.1 s, p95 5.2 s with 1.6 requests per second), because each replica's upsampler and image engine compete for the GPU. In a burst from zero at 1.5 requests per second the first picture came after 17 s here and 35 s there. Base: 4.7 s per picture warm, 18 pictures per minute on one worker (p50 6.6 s).
+Three one-container replicas on the same three B200 deliver at most 1.8 pictures per second (p50 3.1 s, p95 5.2 s with 1.6 requests per second), because each replica's prompt upsampler and image model compete for the GPU. In a burst from zero at 1.5 requests per second the first picture came after 17 s here and 35 s there. Base: 4.7 s per picture warm, 18 pictures per minute on one worker (p50 6.6 s).
