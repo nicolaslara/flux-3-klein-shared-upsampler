@@ -1,19 +1,36 @@
 # FLUX.3 Klein on Modal, shared prompt upsampler
 
-[FLUX.3 Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein) (Distilled, [Base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base), or Base with a LoRA) as authenticated HTTP endpoints on Modal. One always-warm [prompt upsampler](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup) service (vLLM) on a B200 serves every worker; each model is an image worker (SGLang, FP8R) on a B200 that scales to zero and restores from a GPU memory snapshot. Text to image, editing with reference images, layout boxes, captions, JPEG or PNG.
+[FLUX.3 Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein) (Distilled, [Base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base), or Base with a LoRA) as authenticated HTTP endpoints on Modal, with the [prompt upsampler](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup) running once for all of them. Text to image, editing with reference images, layout boxes, captions, JPEG or PNG.
 
-For one endpoint under about 0.5 pictures per second, [flux-3-klein-serving](https://github.com/nicolaslara/flux-3-klein-serving) (one container per replica) is cheaper: the upsampler here costs $6.70 per hour even with no worker up.
+## Topology
+
+```mermaid
+flowchart LR
+    C[Client] -->|POST /generate| D
+    C -->|POST /generate| B
+    subgraph Workers: one Modal app per model, B200 each, scale to zero
+        D[Distilled worker]
+        B[Base worker]
+        L[Base + LoRA worker]
+    end
+    D & B & L <-->|prompt in, caption out| U
+    U[Upsampler service: one Modal app, one B200, always up]
+```
+
+A worker is a Modal server for one model: it holds the text encoder, the FP8R transformer and the autoencoder (SGLang) on one B200, receives requests, sends the prompt to the upsampler, renders the picture and answers. It stops when idle and restores from a GPU memory snapshot. The upsampler is a Modal class running vLLM on one B200 that stays up; workers call it through the Modal SDK, about 40 ms per call. Captions skip it.
+
+Use this layout for more than about 0.5 pictures per second, or for several models. For one quiet endpoint, [flux-3-klein-serving](https://github.com/nicolaslara/flux-3-klein-serving) (upsampler and image engine in one container per replica) is cheaper, because the upsampler here costs $6.70 per hour even with no worker up.
 
 | Distilled, 1024x1024 | |
 |---|---|
 | Per picture, warm | 2.2 s |
 | Pictures per minute on one worker | 76 (p50 2.8 s, p95 4.1 s) |
 | Most pictures per second on three B200 | 2.8, against 1.8 with one container per replica |
-| Cold start with a snapshot, to the first picture | 17 s |
+| Cold start of a worker with a snapshot, to the first picture | 17 s |
 | Cold start without one (first start after a deploy) | 4 min |
 | Kept warm, per hour | $6.70 upsampler, $6.95 per worker |
 
-`upsampler.py` is the upsampler service, `worker.py` the image worker, `flux3_api.py` the request handling, `client.py` an example client, `requirements-pup.txt` the upsampler's locked environment.
+`upsampler.py` is the upsampler service, `worker.py` the worker (configuration, image build, container start, Modal server), `flux3_api.py` the request handling, `requirements-pup.txt` the upsampler's locked environment.
 
 ## Quick start
 
@@ -33,10 +50,18 @@ The first deploys build the images with the weights inside (19 GB and 16 GB). Th
 export URL=https://<workspace>-<environment>--flux3-klein-distilled-shared-server.us-east.modal.direct
 export MODAL_KEY=wk-...
 export MODAL_SECRET=ws-...
-uv run python client.py $URL "Two blue mugs on a wooden table by a window" --seed 42 --out image.jpg
 ```
 
-While no worker is up, every request gets an immediate 503 and starts one, so `client.py` polls `/wake` until it answers 200, then sends `/generate` once. Check the upsampler with `uv run python -c "import modal; print(modal.Cls.from_name('flux3-upsampler', 'Upsampler')().health.remote())"`.
+While no worker is up, every request gets an immediate 503 and starts one. So poll `/wake` until it answers 200, then send `/generate` once; a non-200 means no picture was made.
+
+```
+until curl -sf -o /dev/null -X POST -H "Modal-Key: $MODAL_KEY" -H "Modal-Secret: $MODAL_SECRET" $URL/wake; do sleep 5; done
+curl -sf -H "Modal-Key: $MODAL_KEY" -H "Modal-Secret: $MODAL_SECRET" \
+  --json '{"prompt": "Two blue mugs on a wooden table by a window", "seed": 42}' \
+  $URL/generate -o image.jpg
+```
+
+Check the upsampler with `uv run python -c "import modal; print(modal.Cls.from_name('flux3-upsampler', 'Upsampler')().health.remote())"`.
 
 ## API
 
