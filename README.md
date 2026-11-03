@@ -5,22 +5,16 @@
 ## Architecture
 
 ```mermaid
-flowchart LR
-    C["Client"]
-    subgraph W["Workers, one Modal app per model, one B200 each, scale to zero"]
-        D["Distilled worker"]
-        B["Base worker"]
-        L["Base + LoRA worker"]
+flowchart TB
+    C["Client"] -->|"POST /generate"| W
+    subgraph W["Worker: one Modal app per model (Distilled, Base, Base + LoRA), one B200, scales to zero"]
+        direction LR
+        S1["1 prompt to the upsampler"] --> S2["2 text encoder"] --> S3["3 transformer, 16 or 50 steps"] --> S4["4 autoencoder, picture"]
     end
-    U["Upsampler service, one Modal app, one B200, always up"]
-    C -->|"POST /generate"| D
-    C -->|"POST /generate"| B
-    D <-->|"prompt, caption"| U
-    B <-->|"prompt, caption"| U
-    L <-->|"prompt, caption"| U
+    S1 <-->|"prompt out, caption back"| U["Upsampler service: one Modal app, one B200, always up, shared by every worker"]
 ```
 
-A worker is a Modal server for one model: it holds the text encoder, the FP8R transformer and the autoencoder (SGLang) on one B200, receives requests, sends the prompt to the upsampler, renders the picture and answers. It stops when idle and restores from a GPU memory snapshot. The upsampler is a Modal class running vLLM on one B200 that stays up; workers call it through the Modal SDK, about 40 ms per call. Captions skip it.
+A worker is a Modal server for one model: it holds the text encoder, the FP8R transformer and the autoencoder (SGLang) on one B200. For each request it first sends the prompt to the upsampler and waits for the caption, then renders the picture from that caption and answers. It stops when idle and restores from a GPU memory snapshot. The upsampler is a Modal class running vLLM on one B200 that stays up; workers call it through the Modal SDK, about 40 ms per call. Requests that supply a `caption` skip it.
 
 ## Against one container per replica
 
