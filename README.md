@@ -2,19 +2,22 @@
 
 [FLUX.3 Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein) (Distilled, [Base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base), or Base with a LoRA) as authenticated HTTP endpoints on Modal, with the [prompt upsampler](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup) running once for all of them. Text to image, editing with reference images, layout boxes, captions, JPEG or PNG.
 
-## Topology
+## Architecture
 
 ```mermaid
 flowchart LR
-    C[Client] -->|POST /generate| D
-    C -->|POST /generate| B
-    subgraph Workers: one Modal app per model, B200 each, scale to zero
-        D[Distilled worker]
-        B[Base worker]
-        L[Base + LoRA worker]
+    C["Client"]
+    subgraph W["Workers, one Modal app per model, one B200 each, scale to zero"]
+        D["Distilled worker"]
+        B["Base worker"]
+        L["Base + LoRA worker"]
     end
-    D & B & L <-->|prompt in, caption out| U
-    U[Upsampler service: one Modal app, one B200, always up]
+    U["Upsampler service, one Modal app, one B200, always up"]
+    C -->|"POST /generate"| D
+    C -->|"POST /generate"| B
+    D <-->|"prompt, caption"| U
+    B <-->|"prompt, caption"| U
+    L <-->|"prompt, caption"| U
 ```
 
 A worker is a Modal server for one model: it holds the text encoder, the FP8R transformer and the autoencoder (SGLang) on one B200, receives requests, sends the prompt to the upsampler, renders the picture and answers. It stops when idle and restores from a GPU memory snapshot. The upsampler is a Modal class running vLLM on one B200 that stays up; workers call it through the Modal SDK, about 40 ms per call. Captions skip it.
