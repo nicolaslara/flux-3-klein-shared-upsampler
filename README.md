@@ -33,7 +33,7 @@ The alternative, [flux-3-klein-serving](https://github.com/nicolaslara/flux-3-kl
 | Cold start without a snapshot | 9 min | 4 min |
 | Burst from zero at 1.5 requests per second, first picture | 35 s | 17 s |
 | Most pictures per second on three B200 | 1.8 | 2.8 |
-| $ per 1,000 pictures at that load | 3.20 | 2.06 |
+| $ per 1,000 pictures at that rate | 3.20 | 2.06 |
 | Kept warm, per hour | $6.95 per container | $6.70 upsampler + $6.95 per worker |
 
 Cold starts are shorter because a worker's snapshot holds only the image engine, and the burst recovers faster for the same reason. Pictures per GPU go up because the upsampler no longer competes with the transformer for the GPU: a worker renders 1.5 pictures per second against 0.7 for a container doing both. The upsampler is a fixed $6.70 per hour, so with one worker the two layouts cost about the same per picture, and every further worker costs a third less. For one quiet endpoint, one container per replica is cheaper.
@@ -126,12 +126,12 @@ Environment variables read at deploy time, for example `MODEL=base REPLICAS=4 uv
 
 ## Measurements
 
-Distilled FP8R, 1024x1024 JPEG, unique prompts, everything in `us-east`, independent arrivals at the offered rate.
+Distilled, 1024x1024, unique prompts, everything in `us-east`. Requests arrive independently at the given rate; p50 and p95 are the time from request to picture, waiting included.
 
-| fleet | offered per second | delivered per second | p50 / p95 | $ per 1,000 pictures |
+| workers | requests per second | pictures per second | p50 / p95 | $ per 1,000 pictures |
 |---|---|---|---|---|
 | 1 worker | 1.5 | 1.27 | 2.8 / 4.1 s | 3.00 |
 | 2 workers | 3.0 | 2.78 | 4.2 / 7.1 s | 2.06 |
 | 3 workers | 4.0 | 3.75 | 3.1 / 5.0 s | 2.04 |
 
-Three one-container replicas on the same three B200 deliver at most 1.8 pictures per second (p50 3.1 s, p95 5.2 s at 1.6 offered), because each replica's upsampler and image engine compete for the GPU. In a burst from zero at 1.5 requests per second the first picture came after 17 s here and 35 s there. Base: 4.7 s per picture warm, 18 pictures per minute on one worker (p50 6.6 s).
+Three one-container replicas on the same three B200 deliver at most 1.8 pictures per second (p50 3.1 s, p95 5.2 s with 1.6 requests per second), because each replica's upsampler and image engine compete for the GPU. In a burst from zero at 1.5 requests per second the first picture came after 17 s here and 35 s there. Base: 4.7 s per picture warm, 18 pictures per minute on one worker (p50 6.6 s).
