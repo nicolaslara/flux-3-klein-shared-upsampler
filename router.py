@@ -15,7 +15,6 @@ UPSAMPLER_APP = os.getenv("UPSAMPLER_APP", "flux3-upsampler")
 # model name -> worker app; a name that is not listed maps to flux3-klein-<name>-shared.
 WORKERS = dict(item.split("=", 1) for item in os.getenv("WORKERS", "").split(",") if item)
 DEADLINE = 900
-REGION = os.getenv("REGION") or None  # us-east, the routing region, keeps every hop short
 SAMPLING = dict(model="pup", temperature=0.0, top_p=0.95, top_k=20, min_p=0.0, max_tokens=3584)
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
@@ -29,7 +28,6 @@ image = (
             "APP_NAME": APP_NAME,
             "UPSAMPLER_APP": UPSAMPLER_APP,
             "WORKERS": os.getenv("WORKERS", ""),
-            "REGION": REGION or "",
         }
     )
 )
@@ -225,7 +223,8 @@ def create_api(runtime):
     max_concurrency=64,
     startup_timeout=120,
     routing_region="us-east",
-    compute_region=REGION,
+    # The routing region, where every worker URL is served; keeping the router there keeps the hops short.
+    compute_region="us-east",
     unauthenticated=False,
     secrets=[modal.Secret.from_name("flux3-router")],
 )

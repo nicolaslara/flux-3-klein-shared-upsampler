@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import modal
@@ -35,7 +36,6 @@ if HIGH_RES and MODEL != "distilled":
 if HIGH_RES and GPU != "B200":
     raise ValueError("HIGH_RES is currently qualified only on B200")
 UPSAMPLER_APP = os.getenv("UPSAMPLER_APP", "flux3-upsampler")
-REGION = os.getenv("REGION") or None
 MAX_INFLIGHT = int(os.getenv("MAX_INFLIGHT", "16"))
 # Requests sent to the image engine at once. It renders one at a time; the second request's JPEG
 # encoding and transfer overlap the next render.
@@ -251,6 +251,48 @@ def serving_policy():
     )
 
 
+# The engine runs this after every request; the worker creates the flag file during its warmup only.
+RELEASE_FLAG = "/tmp/flux3-release-cache"
+RELEASE_HOOK = f'''
+
+
+def _flux3_release_cache():
+    """Return the caching allocator's unused segments to the device while the worker warms up."""
+    import os
+
+    import torch
+
+    if os.path.exists({RELEASE_FLAG!r}):
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+'''
+
+
+def patch_engine_source(path, needle, replacement, append=""):
+    """Edit the pinned engine source at one reviewed line, refusing any other version of the file."""
+    source = path.read_text()
+    if source.count(needle) != 1:
+        raise RuntimeError(f"Pinned SGLang source differs from the reviewed version: {path.name}")
+    patched = source.replace(needle, replacement) + append
+    compile(patched, str(path), "exec")
+    path.write_text(patched)
+    return source, patched
+
+
+@contextmanager
+def releasing_allocator_cache():
+    """Have the engine drop its allocator cache after each request for the duration of the block.
+
+    A GPU snapshot carries every segment the caching allocator holds, used or not. Without the release the
+    warmup picture's activation peak ships inside the snapshot and streams back on every restore.
+    """
+    Path(RELEASE_FLAG).touch()
+    try:
+        yield
+    finally:
+        Path(RELEASE_FLAG).unlink(missing_ok=True)
+
+
 def guard_vae(source):
     """Reject quadratic attention above 4MP if the native efficient path is unavailable."""
     expected = "0bb139ea9d377acca6a859121efc24e86f0095a46976cfbd6043deff4a9ceda4"
@@ -343,14 +385,18 @@ def prepare_model(model, high_res=False, lora_repo=""):
     expected = {*range(multiple, warmup_limit, multiple), warmup_limit}
     if set(captions) != expected:
         raise RuntimeError(f"Incomplete warmup token buckets: {sorted(captions)}")
-    path = source_root / "multimodal_gen/runtime/warmup_request_builder.py"
-    source = path.read_text()
-    needle = "else (DEFAULT_PLACEHOLDER_PROMPT,)"
-    if source.count(needle) != 1:
-        raise RuntimeError("Pinned SGLang warmup source differs from the reviewed version")
-    patched = source.replace(needle, f"else {tuple(captions.values())!r}")
-    compile(patched, str(path), "exec")
-    path.write_text(patched)
+    source, patched = patch_engine_source(
+        source_root / "multimodal_gen/runtime/warmup_request_builder.py",
+        "else (DEFAULT_PLACEHOLDER_PROMPT,)",
+        f"else {tuple(captions.values())!r}",
+    )
+    logged = "        self._log_warmup_result(output_batch, processed_req, is_warmup)\n"
+    patch_engine_source(
+        source_root / "multimodal_gen/runtime/managers/scheduler.py",
+        logged,
+        logged + "        _flux3_release_cache()\n",
+        append=RELEASE_HOOK,
+    )
     vae_patch_sha256 = None
     if high_res:
         vae_path = source_root / "multimodal_gen/runtime/models/vaes/flux3_image_vae.py"
@@ -408,7 +454,6 @@ image = (
             "IDLE_SECONDS": str(IDLE_SECONDS),
             "HIGH_RES": str(int(HIGH_RES)),
             "UPSAMPLER_APP": UPSAMPLER_APP,
-            "REGION": REGION or "",
             "MAX_INFLIGHT": str(MAX_INFLIGHT),
             "IMAGE_SLOTS": str(IMAGE_SLOTS),
         }
@@ -430,7 +475,6 @@ app = modal.App(APP_NAME)
     scaledown_window=IDLE_SECONDS,
     startup_timeout=900,
     routing_region="us-east",
-    compute_region=REGION,
     unauthenticated=False,
     # The source is in the image, so an unchanged redeploy keeps its memory snapshot.
     include_source=False,
@@ -449,34 +493,37 @@ class Server:
         self.processes = {}
         # The engine imports and loads while this process loads its tokenizers.
         image_command = engine_command(MODEL, LORA_REPO)
-        self.launch("image", image_command, {**os.environ, **ENGINE_ENV})
-        self.tokenizer = AutoTokenizer.from_pretrained("/weights/pup", local_files_only=True)
-        self.image_processor = AutoProcessor.from_pretrained(
-            Path(CHECKPOINT) / "text_encoder", local_files_only=True
-        )
-        self.image_text_max_tokens = json.loads((Path(CHECKPOINT) / "config.json").read_text())[
-            "text_encoder"
-        ]["max_tokens"]
-        self.serving_policy = serving_policy()
-        self.request_timeout = REQUEST_TIMEOUT
-        self.system_prompts = json.loads(Path("/weights/pup/system_prompts.json").read_text())
-        self.system_prompt = self.system_prompts["t2i"]
-        self.stop_tokens = [self.tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")]
-        self.max_inflight = MAX_INFLIGHT
-        self.pipeline_slots = PIPELINE_SLOTS
-        self.image_slots = IMAGE_SLOTS
-        self.upsampler = modal.Cls.from_name(UPSAMPLER_APP, "Upsampler")()
-        # The upsampler's health check and warmup expansion, which wait for a cold upsampler, run while
-        # the engine warms up. The upsampler must already be deployed in this environment; a missing one
-        # fails the start when the expansion is collected.
-        warmup = ThreadPoolExecutor(1).submit(self.warmup_expansion)
-        self.wait_for("image", 8001)
-        caption = warmup.result()
-        from flux3_api import prepare_generation, validate_caption_tokens
+        with releasing_allocator_cache():
+            self.launch("image", image_command, {**os.environ, **ENGINE_ENV})
+            self.tokenizer = AutoTokenizer.from_pretrained("/weights/pup", local_files_only=True)
+            self.image_processor = AutoProcessor.from_pretrained(
+                Path(CHECKPOINT) / "text_encoder", local_files_only=True
+            )
+            self.image_text_max_tokens = json.loads((Path(CHECKPOINT) / "config.json").read_text())[
+                "text_encoder"
+            ]["max_tokens"]
+            self.serving_policy = serving_policy()
+            self.request_timeout = REQUEST_TIMEOUT
+            self.system_prompts = json.loads(Path("/weights/pup/system_prompts.json").read_text())
+            self.system_prompt = self.system_prompts["t2i"]
+            self.stop_tokens = [
+                self.tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")
+            ]
+            self.max_inflight = MAX_INFLIGHT
+            self.pipeline_slots = PIPELINE_SLOTS
+            self.image_slots = IMAGE_SLOTS
+            self.upsampler = modal.Cls.from_name(UPSAMPLER_APP, "Upsampler")()
+            # The upsampler's health check and warmup expansion, which wait for a cold upsampler, run while
+            # the engine warms up. The upsampler must already be deployed in this environment; a missing one
+            # fails the start when the expansion is collected.
+            warmup = ThreadPoolExecutor(1).submit(self.warmup_expansion)
+            self.wait_for("image", 8001)
+            caption = warmup.result()
+            from flux3_api import prepare_generation, validate_caption_tokens
 
-        prepared = prepare_generation({"caption": caption, "seed": 42}, MODEL, self.serving_policy)
-        validate_caption_tokens(prepared.text.caption, self.image_processor, self.image_text_max_tokens)
-        generate_once(prepared.image_parameters(), 120)
+            prepared = prepare_generation({"caption": caption, "seed": 42}, MODEL, self.serving_policy)
+            validate_caption_tokens(prepared.text.caption, self.image_processor, self.image_text_max_tokens)
+            generate_once(prepared.image_parameters(), 120)
         self.build = json.loads(Path("/build.json").read_text())
         self.commands = {"image": image_command}
         print(

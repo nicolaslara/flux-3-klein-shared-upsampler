@@ -12,7 +12,6 @@ import modal
 GPU = os.getenv("GPU", "B200").strip().upper()
 if GPU not in ("H100", "H100!", "H200", "B200"):
     raise ValueError("Choose one GPU type: H100, H100!, H200 or B200")
-REGION = os.getenv("REGION") or None
 APP_NAME = os.getenv("APP_NAME", "flux3-upsampler")
 MAX_SEQS = 64
 MEMORY_FRACTION = "0.85"
@@ -47,7 +46,7 @@ image = (
         "ln -s lib /opt/pup/lib/python3.12/site-packages/nvidia/cu13/lib64",
         "ln -s libcudart.so.13 /opt/pup/lib/python3.12/site-packages/nvidia/cu13/lib/libcudart.so",
     )
-    .env({"GPU": GPU, "REGION": REGION or "", "APP_NAME": APP_NAME, "HF_HUB_OFFLINE": "1"})
+    .env({"GPU": GPU, "APP_NAME": APP_NAME, "HF_HUB_OFFLINE": "1"})
 )
 app = modal.App(APP_NAME)
 
@@ -61,7 +60,6 @@ app = modal.App(APP_NAME)
     max_containers=1,
     startup_timeout=900,
     timeout=300,
-    region=REGION,
 )
 @modal.concurrent(max_inputs=MAX_SEQS, target_inputs=MAX_SEQS)
 class Upsampler:
