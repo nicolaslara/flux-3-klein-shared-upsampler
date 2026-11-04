@@ -4,31 +4,23 @@
 
 ## Architecture
 
-Three Modal apps:
+Two Modal apps:
 
 - The **prompt upsampler**: Black Forest Labs' 9B language model that turns a short prompt into the detailed caption the image model expects. One B200, always up.
-- A **worker** per model: the image model itself, one app, one B200 per container. Starts on demand, stops after 120 s idle, restores from a GPU memory snapshot.
-- The **router**: a small CPU app, always up, the one URL clients call. It expands the prompt and starts the worker at the same time, holds the request until the worker is ready, then hands it the caption.
+- A **worker** per model: the image model itself, one app, one B200 per container, the URL clients call. Starts on demand, stops after 120 s idle, restores from a GPU memory snapshot. It asks the prompt upsampler for the caption and answers 503 while it starts.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant R as Router (CPU, always up)
-    participant U as Prompt upsampler (B200, always up)
     participant W as Worker (per model, B200, on demand)
-    C->>R: POST /generate, prompt, model
-    par
-        R->>U: prompt
-        U-->>R: caption
-    and
-        R->>W: wake, until ready
-    end
-    R->>W: caption
-    W-->>R: picture
-    R-->>C: picture
+    participant U as Prompt upsampler (B200, always up)
+    C->>W: POST /generate, prompt
+    W->>U: prompt
+    U-->>W: caption
+    W-->>C: picture
 ```
 
-The caption takes about 1.3 s, the picture 0.7 s (Distilled) or 3.3 s (Base); a request that carries a `caption` skips the prompt upsampler. The router adds about 0.1 s to a warm picture and hides the caption inside the worker's start on a cold one. A worker called at its own URL asks the prompt upsampler itself and answers 503 while it starts.
+The caption takes about 1.3 s, the picture 0.7 s (Distilled) or 3.3 s (Base); a request that carries a `caption` skips the prompt upsampler. An [optional router](#optional-router) can take the request instead, expand the prompt while the worker starts and hold the request in place of the 503.
 
 ## Against one container per replica
 
@@ -46,11 +38,11 @@ The alternative, [flux-3-klein-serving](https://github.com/nicolaslara/flux-3-kl
 
 Cold starts are shorter because a worker's snapshot holds only the image model. Pictures per GPU go up because the prompt upsampler no longer competes with the transformer: 1.5 pictures per second on a worker against 0.7 on a container doing both. The prompt upsampler is a fixed $6.70 per hour: one worker costs about the same per picture as one container, every further worker a third less. For one quiet endpoint, one container per replica is cheaper.
 
-`upsampler.py` is the prompt upsampler, `worker.py` the worker, `router.py` the router, `flux3_api.py` the request handling shared by worker and router, `requirements-pup.txt` the prompt upsampler's locked environment.
+`upsampler.py` is the prompt upsampler, `worker.py` the worker, `flux3_api.py` the request handling, `router.py` the optional router, `requirements-pup.txt` the prompt upsampler's locked environment.
 
 ## Quick start
 
-Accept the terms on Hugging Face for the model and the prompt upsampler, then deploy in this order. The router stores a proxy auth token (Modal dashboard, Settings, Proxy Auth Tokens) in the `flux3-router` secret to call the workers:
+Accept the terms on Hugging Face for the model and the prompt upsampler, then deploy in this order:
 
 ```
 uv sync
@@ -58,22 +50,20 @@ uv run modal setup
 uv run modal secret create huggingface HF_TOKEN=hf_...
 uv run modal deploy upsampler.py
 uv run modal deploy worker.py
-uv run modal secret create flux3-router MODAL_KEY=wk-... MODAL_SECRET=ws-...
-uv run modal deploy router.py
 ```
 
-The first deploys build the images (19 GB and 16 GB). The router's deploy prints its URL; export it with the client's proxy auth token:
+The first deploys build the images (19 GB and 16 GB); the worker's build ends with a GPU step of about three minutes that runs the engine's warmup once and keeps its kernel caches. The worker's deploy prints its URL; export it with a proxy auth token (Modal dashboard, Settings, Proxy Auth Tokens):
 
 ```
-export URL=https://<workspace>-<environment>--flux3-router-router.us-east.modal.direct
+export URL=https://<workspace>-<environment>--flux3-klein-distilled-shared-server.us-east.modal.direct
 export MODAL_KEY=wk-...
 export MODAL_SECRET=ws-...
 ```
 
-The router holds the request while the worker starts; a non-200 means no picture was made.
+A worker answers 503 while it starts, so retry until it answers; any other non-200 means no picture was made.
 
 ```
-curl -sf -H "Modal-Key: $MODAL_KEY" -H "Modal-Secret: $MODAL_SECRET" \
+curl -sf --retry 120 --retry-delay 5 -H "Modal-Key: $MODAL_KEY" -H "Modal-Secret: $MODAL_SECRET" \
   --json '{"prompt": "Two blue mugs on a wooden table by a window", "seed": 42}' \
   $URL/generate -o image.jpg
 ```
@@ -92,9 +82,8 @@ curl -sf -H "Modal-Key: $MODAL_KEY" -H "Modal-Secret: $MODAL_SECRET" \
 | `steps` | 16 Distilled, 50 Base | 1 to 100 |
 | `guidance` | 3.5 on Base | 0 to 20. Not used by Distilled |
 | `output_format` | `jpeg` | `jpeg` (quality 95) or `png` |
-| `model` | `distilled` | Router only: `distilled`, `base` or a `WORKERS` name |
 
-The response is the picture; headers `X-Pup-Ms`, `X-Upsampler-Ms` and `X-Image-Ms` give the prompt expansion, its part inside the prompt upsampler, and the picture generation, `X-Caption` the caption URL-encoded, `X-Wake-Ms` the wait for the worker (the expansion overlaps it) and `X-Router-Ms` the total. The router never answers 503 during a cold start. 422 is an invalid request, 429 a worker holding 16 requests, 502 a prompt upsampler or engine failure, 503 an app that is not deployed, 504 the deadline, 900 s at the router and 300 s at a worker.
+The response is the picture; headers `X-Pup-Ms`, `X-Upsampler-Ms` and `X-Image-Ms` give the prompt expansion, its part inside the prompt upsampler, and the picture generation, `X-Caption` the caption URL-encoded. 422 is an invalid request, 429 a worker holding 16 requests, 502 a prompt upsampler or engine failure, 503 a worker that is starting, 504 the 300 s deadline.
 
 Editing: reference pictures go base64-encoded in `images`; the body goes in a file:
 
@@ -107,15 +96,13 @@ Layouts: end the prompt with a JSON list of boxes, `[y_min, x_min, y_max, x_max]
 
 ## Cold starts and scaling
 
-A worker stops 120 s after its last request; the next request starts one, 17 s with a snapshot and four to nine minutes without (the first start after a deploy, or on a host that has no copy of the image or the snapshot), while the router expands the prompt and holds the request. `uv run modal run worker.py --warm 1` keeps a worker up. A worker holds 16 requests and renders one at a time; beyond that Modal queues and adds workers, up to `REPLICAS`. One prompt upsampler fed three workers at 3.75 pictures per second with headroom.
+A worker stops 120 s after its last request; the next request starts one and gets 503 until it is ready, 17 s with a snapshot and four to nine minutes without (the first start after a deploy, or on a host that has no copy of the image or the snapshot). The kernel caches built into the image take about 30 s off a fresh boot's warmup. `uv run modal run worker.py --warm 1` keeps a worker up. A worker holds 16 requests and renders one at a time; beyond that Modal queues and adds workers, up to `REPLICAS`. One prompt upsampler fed three workers at 3.75 pictures per second with headroom.
 
 ## Configuration
 
 Environment variables read at deploy time, for example `MODEL=base REPLICAS=4 uv run modal deploy worker.py`. A redeploy with the same code and settings keeps the snapshot.
 
 `upsampler.py`: `GPU` (`B200`; H200 is $1.70 per hour cheaper and 0.4 s slower per expansion), `REGION` (unset; use the same value as the workers), `APP_NAME` (`flux3-upsampler`).
-
-`router.py`: `WORKERS` (unset; `mylora=flux3-klein-base-lora-shared,...`; a `model` not listed maps to `flux3-klein-<model>-shared`), `UPSAMPLER_APP` (`flux3-upsampler`), `APP_NAME` (`flux3-router`); the `flux3-router` secret holds its proxy token.
 
 `worker.py`:
 
@@ -134,6 +121,17 @@ Environment variables read at deploy time, for example `MODEL=base REPLICAS=4 uv
 | `MAX_INFLIGHT` | `16` | Requests a worker holds before answering 429 |
 | `IMAGE_SLOTS` | `2` | Requests at the image engine at once |
 
+## Optional router
+
+`router.py` is a small CPU app, always up, that takes the request in the worker's place: it expands the prompt and starts the worker at the same time, holds the request until the worker is ready, then hands it the caption. Clients never see a 503. It adds about 0.1 s to a warm picture and saves the caption's 1.3 s on a cold one, which with the prompt upsampler always up is its whole gain, for a CPU container, a proxy auth token and one more hop. Use it when clients cannot retry.
+
+```
+uv run modal secret create flux3-router MODAL_KEY=wk-... MODAL_SECRET=ws-...
+uv run modal deploy router.py
+```
+
+Its URL is `https://<workspace>-<environment>--flux3-router-router.us-east.modal.direct`. The body gains `model` (`distilled`, `base` or a `WORKERS` name; default `distilled`); the response gains `X-Wake-Ms`, the wait for the worker with the expansion overlapping it, and `X-Router-Ms`, the total; 503 is a worker app that is not deployed and the deadline is 900 s. Settings: `WORKERS` (unset; `mylora=flux3-klein-base-lora-shared,...`; a `model` not listed maps to `flux3-klein-<model>-shared`), `UPSAMPLER_APP` (`flux3-upsampler`), `APP_NAME` (`flux3-router`), `REGION` (unset; `us-east`, the workers' routing region, is where every hop is shortest). Measured through it: warm pictures 2.0 s, a cold picture 19 s with a snapshot, and a one-minute burst from zero served 79 of 80 requests with no 503, first picture at 19 to 34 s.
+
 ## Measurements
 
 Distilled, 1024x1024, unique prompts, everything in `us-east`, requests arriving independently at the given rate; p50 and p95 are request to picture, waiting included.
@@ -144,4 +142,6 @@ Distilled, 1024x1024, unique prompts, everything in `us-east`, requests arriving
 | 2 workers | 3.0 | 2.78 | 4.2 / 7.1 s | 2.06 |
 | 3 workers | 4.0 | 3.75 | 3.1 / 5.0 s | 2.04 |
 
-Three one-container replicas on the same three B200 deliver at most 1.8 pictures per second (p50 3.1 s, p95 5.2 s with 1.6 requests per second). In a burst from zero at 1.5 requests per second the first picture came after 17 s here and 35 s there. Through the router: warm pictures 2.0 s, a cold picture 19 s with a snapshot, and a one-minute burst from zero served 79 of 80 requests with no 503, first picture at 19 to 34 s. Base: 4.7 s per picture warm, 18 pictures per minute on one worker (p50 6.6 s).
+Three one-container replicas on the same three B200 deliver at most 1.8 pictures per second (p50 3.1 s, p95 5.2 s with 1.6 requests per second). In a burst from zero at 1.5 requests per second the first picture came after 17 s here and 35 s there. Base: 4.7 s per picture warm, 18 pictures per minute on one worker (p50 6.6 s).
+
+A fresh boot, no snapshot, request to first picture: Distilled 214 to 305 s with the kernel caches in the image against 323 s without, Base 289 s against 388 s. The engine's warmup inside those boots: Distilled 23 to 28 s against 44 to 59 s, Base 65 s against 91 to 101 s; the rest of a fresh boot is scheduling, the container filesystem, the engine's imports and the snapshot capture. Pictures are byte-identical with and without the caches (10 of 10 at fixed seeds and captions, text to image and edits), and warm throughput is unchanged: 2.0 s per picture at one in flight, 1.45 to 1.54 pictures per second at four.

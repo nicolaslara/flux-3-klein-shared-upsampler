@@ -40,9 +40,11 @@ MAX_INFLIGHT = int(os.getenv("MAX_INFLIGHT", "16"))
 # Requests sent to the image engine at once. It renders one at a time; the second request's JPEG
 # encoding and transfer overlap the next render.
 IMAGE_SLOTS = int(os.getenv("IMAGE_SLOTS", "2"))
-PIPELINE_SLOTS = 4
-if not 1 <= IMAGE_SLOTS <= 4 or not PIPELINE_SLOTS <= MAX_INFLIGHT <= 32:
-    raise ValueError(f"IMAGE_SLOTS must be 1-4 and MAX_INFLIGHT {PIPELINE_SLOTS}-32")
+# Requests expanding at the upsampler or waiting for the image engine at once. The upsampler batches
+# its completions, so every held request expands immediately and queues only for the render.
+PIPELINE_SLOTS = MAX_INFLIGHT
+if not 1 <= IMAGE_SLOTS <= 4 or not 1 <= MAX_INFLIGHT <= 32:
+    raise ValueError("IMAGE_SLOTS must be 1-4 and MAX_INFLIGHT 1-32")
 QUALITY = "lossless" if MODEL == "distilled" else "exact"
 REQUEST_TIMEOUT = 900 if HIGH_RES else 300
 SNAPSHOT = os.getenv("SNAPSHOT", "1") == "1"
@@ -59,8 +61,170 @@ REGISTRY = "lmsysorg/sglang@sha256:b4f09a2ccbcfcc262d49600c3cd7f8581a793ea7d1049
 CHECKPOINT = "/weights/flux-3-image-klein" + ("-base" if MODEL == "base" else "")
 LORA_PATH = "/weights/lora"
 SAMPLING = dict(temperature=0.0, top_p=0.95, top_k=20, min_p=0.0, max_tokens=3584, presence_penalty=1.5)
+ENGINE_ENV = {"SGLANG_FORCE_FUSED_OP_BACKEND": "torch"}
+# Kernel caches the engine fills on its first warmup; the image build runs that warmup once on the
+# deployment's GPU type so every fresh boot reads them instead of compiling.
+CACHE_ENV = {
+    "HF_HUB_OFFLINE": "1",
+    "SGLANG_CACHE_DIT_ENABLED": "false",
+    "TORCHINDUCTOR_CACHE_DIR": "/cache/image/inductor",
+    "TRITON_CACHE_DIR": "/cache/image/triton",
+    "CUDA_CACHE_PATH": "/cache/image/cuda",
+}
+KERNEL_CACHES = ("/cache/image", "/root/.cache/sglang")
+BUILD_CAPTION = (
+    "A still life photograph of two blue ceramic mugs on a weathered oak table beside a tall window, "
+    "soft morning light falling across the wood grain and catching the glaze of the mugs, a folded "
+    "linen napkin and a small brass spoon beside them, shallow depth of field, muted warm tones, the "
+    "garden outside blurred into green and gold, quiet and unhurried, shot on medium format film."
+)
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+
+
+def engine_command(model, lora_repo=""):
+    """The image engine's command line; the image build and the worker must start it identically."""
+    return [
+        "sglang",
+        "serve",
+        "--model-path",
+        "/weights/flux-3-image-klein" + ("-base" if model == "base" else ""),
+        "--model-variant",
+        "fp8r",
+        *(["--lora-path", LORA_PATH] if lora_repo else []),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8001",
+        "--num-gpus",
+        "1",
+        "--attention-backend",
+        "torch_sdpa",
+        "--cpu-offload-components",
+        "none",
+        "--batching-max-size",
+        "1",
+        "--batching-delay-ms",
+        "0",
+        "--output-path",
+        "",
+        "--enable-breakable-cuda-graph",
+        str(model == "distilled").lower(),
+        "--warmup-mode",
+        "server",
+        "--warmup-resolutions",
+        "1024x1024",
+        "--warmup-steps",
+        str(16 if model == "distilled" else 50),
+        "--warmup-sampling-params",
+        json.dumps(
+            {
+                "quality": "lossless" if model == "distilled" else "exact",
+                **({"guidance_scale": 3.5} if model == "base" else {}),
+            }
+        ),
+    ]
+
+
+def wait_for_engine(process, timeout):
+    import httpx
+
+    deadline = time.monotonic() + timeout
+    with httpx.Client(timeout=5) as client:
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError("image engine exited; inspect the container logs")
+            try:
+                if client.get("http://127.0.0.1:8001/health").status_code == 200:
+                    return
+            except httpx.TransportError:
+                pass
+            time.sleep(1)
+    raise TimeoutError("image engine exceeded the startup deadline")
+
+
+def generate_once(parameters, timeout):
+    """One picture from the local engine, checked to be the expected 1024-square JPEG."""
+    import base64
+    import io
+
+    import httpx
+    from PIL import Image
+
+    with httpx.Client(timeout=timeout) as client:
+        generated = client.post(
+            "http://127.0.0.1:8001/v1/images/generations", json=parameters
+        ).raise_for_status()
+    raw = base64.b64decode(generated.json()["data"][0]["b64_json"], validate=True)
+    with Image.open(io.BytesIO(raw)) as output:
+        if output.size != (1024, 1024) or output.format != "JPEG":
+            raise RuntimeError("Generation did not return the expected 1024-square JPEG")
+        output.load()
+    return raw
+
+
+def compile_kernels(model, lora_repo=""):
+    """Run the engine's warmup on the build GPU once so its JIT kernels and autotune tables ship in the image."""
+    started = time.monotonic()
+    started_at = time.time()
+    process = subprocess.Popen(
+        engine_command(model, lora_repo),
+        env={**os.environ, **ENGINE_ENV, "HOME": "/root"},
+        start_new_session=True,
+    )
+    try:
+        wait_for_engine(process, 1500)
+        ready_s = time.monotonic() - started
+        generate_once(
+            {
+                "prompt": BUILD_CAPTION,
+                "seed": 42,
+                "generator_device": "cpu",
+                "num_inference_steps": 16 if model == "distilled" else 50,
+                "quality": "lossless" if model == "distilled" else "exact",
+                "output_format": "jpeg",
+                "response_format": "b64_json",
+                "enable_cache_dit": False,
+                "enhance_prompt": False,
+                "output_compression": 95,
+                "size": "1024x1024",
+                **({"guidance_scale": 3.5} if model == "base" else {}),
+            },
+            900,
+        )
+        generated_s = time.monotonic() - started
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+    written, total = {}, {}
+    for root in KERNEL_CACHES:
+        for path in Path(root).rglob("*"):
+            if not path.is_file():
+                continue
+            parts = path.relative_to(root).parts
+            key = f"{root}/{parts[0]}" if len(parts) > 1 else root
+            size = path.stat().st_size
+            total[key] = total.get(key, 0) + size
+            if path.stat().st_mtime >= started_at - 1:
+                written[key] = written.get(key, 0) + size
+    if not written:
+        raise RuntimeError(
+            "The build warmup wrote nothing under the kernel caches; the engine's cache paths changed"
+        )
+    report = {
+        "engine_ready_s": ready_s,
+        "first_picture_s": generated_s,
+        "written_bytes": written,
+        "cache_bytes": total,
+    }
+    build = json.loads(Path("/build.json").read_text())
+    build["kernel_cache"] = report
+    Path("/build.json").write_text(json.dumps(build, indent=2))
+    print("FLUX3_BUILD_KERNELS " + json.dumps(report), flush=True)
 
 
 def create_api(runtime):
@@ -221,6 +385,15 @@ image = (
         secrets=[modal.Secret.from_name("huggingface")],
         timeout=1800,
     )
+    .env(CACHE_ENV)
+    .run_function(
+        compile_kernels,
+        kwargs={"model": MODEL, "lora_repo": LORA_REPO},
+        gpu=GPU,
+        cpu=4,
+        memory=65536,
+        timeout=2400,
+    )
     .add_local_file(ROOT / "flux3_api.py", "/root/flux3_api.py", copy=True)
     .add_local_file(ROOT / "worker.py", "/root/worker.py", copy=True)
     .env(
@@ -238,11 +411,6 @@ image = (
             "REGION": REGION or "",
             "MAX_INFLIGHT": str(MAX_INFLIGHT),
             "IMAGE_SLOTS": str(IMAGE_SLOTS),
-            "HF_HUB_OFFLINE": "1",
-            "SGLANG_CACHE_DIT_ENABLED": "false",
-            "TORCHINDUCTOR_CACHE_DIR": "/cache/image/inductor",
-            "TRITON_CACHE_DIR": "/cache/image/triton",
-            "CUDA_CACHE_PATH": "/cache/image/cuda",
         }
     )
 )
@@ -272,16 +440,16 @@ app = modal.App(APP_NAME)
 class Server:
     @modal.enter(snap=SNAPSHOT)
     def prepare(self):
-        import base64
-        import io
+        from concurrent.futures import ThreadPoolExecutor
 
-        import httpx
-        from PIL import Image
         from transformers import AutoProcessor, AutoTokenizer
 
         self.source_task = os.getenv("MODAL_TASK_ID")
         self.prepared_at = time.time()
         self.processes = {}
+        # The engine imports and loads while this process loads its tokenizers.
+        image_command = engine_command(MODEL, LORA_REPO)
+        self.launch("image", image_command, {**os.environ, **ENGINE_ENV})
         self.tokenizer = AutoTokenizer.from_pretrained("/weights/pup", local_files_only=True)
         self.image_processor = AutoProcessor.from_pretrained(
             Path(CHECKPOINT) / "text_encoder", local_files_only=True
@@ -297,93 +465,54 @@ class Server:
         self.max_inflight = MAX_INFLIGHT
         self.pipeline_slots = PIPELINE_SLOTS
         self.image_slots = IMAGE_SLOTS
-        # The upsampler must already be deployed in this environment; a missing one fails the start here.
         self.upsampler = modal.Cls.from_name(UPSAMPLER_APP, "Upsampler")()
-        self.upsampler_health = self.upsampler.health.remote()
-        image_command = [
-            "sglang",
-            "serve",
-            "--model-path",
-            CHECKPOINT,
-            "--model-variant",
-            "fp8r",
-            *(["--lora-path", LORA_PATH] if LORA_REPO else []),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "8001",
-            "--num-gpus",
-            "1",
-            "--attention-backend",
-            "torch_sdpa",
-            "--cpu-offload-components",
-            "none",
-            "--batching-max-size",
-            "1",
-            "--batching-delay-ms",
-            "0",
-            "--output-path",
-            "",
-            "--enable-breakable-cuda-graph",
-            str(MODEL == "distilled").lower(),
-            "--warmup-mode",
-            "server",
-            "--warmup-resolutions",
-            "1024x1024",
-            "--warmup-steps",
-            str(STEPS),
-            "--warmup-sampling-params",
-            json.dumps({"quality": QUALITY, **({"guidance_scale": 3.5} if MODEL == "base" else {})}),
-        ]
-        self.launch("image", image_command, {**os.environ, "SGLANG_FORCE_FUSED_OP_BACKEND": "torch"})
+        # The upsampler's health check and warmup expansion, which wait for a cold upsampler, run while
+        # the engine warms up. The upsampler must already be deployed in this environment; a missing one
+        # fails the start when the expansion is collected.
+        warmup = ThreadPoolExecutor(1).submit(self.warmup_expansion)
         self.wait_for("image", 8001)
-        with httpx.Client(timeout=120) as client:
-            text = self.tokenizer.apply_chat_template(
-                [
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": "Two blue mugs on a wooden table by a window"},
-                ],
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-            reply = self.upsampler.expand.remote(
-                {
-                    "path": "/v1/completions",
-                    "json": {
-                        "model": "pup",
-                        "prompt": self.tokenizer.encode(text, add_special_tokens=False),
-                        **SAMPLING,
-                        "stop_token_ids": self.stop_tokens,
-                    },
-                }
-            )
-            if reply["status"] != 200:
-                raise RuntimeError(f"Warmup prompt expansion failed at the upsampler: {reply['status']}")
-            answer = reply["result"]["choices"][0]
-            if answer.get("finish_reason") != "stop" or not answer.get("text", "").strip():
-                raise RuntimeError("Warmup prompt expansion did not complete")
-            from flux3_api import prepare_generation, validate_caption_tokens
+        caption = warmup.result()
+        from flux3_api import prepare_generation, validate_caption_tokens
 
-            prepared = prepare_generation(
-                {"caption": answer["text"].strip(), "seed": 42}, MODEL, self.serving_policy
-            )
-            validate_caption_tokens(prepared.text.caption, self.image_processor, self.image_text_max_tokens)
-            generated = client.post(
-                "http://127.0.0.1:8001/v1/images/generations",
-                json=prepared.image_parameters(),
-            ).raise_for_status()
-            raw = base64.b64decode(generated.json()["data"][0]["b64_json"], validate=True)
-            with Image.open(io.BytesIO(raw)) as output:
-                if output.size != (1024, 1024) or output.format != "JPEG":
-                    raise RuntimeError("Warmup did not return the expected 1024-square JPEG")
-                output.load()
+        prepared = prepare_generation({"caption": caption, "seed": 42}, MODEL, self.serving_policy)
+        validate_caption_tokens(prepared.text.caption, self.image_processor, self.image_text_max_tokens)
+        generate_once(prepared.image_parameters(), 120)
         self.build = json.loads(Path("/build.json").read_text())
         self.commands = {"image": image_command}
         print(
             "FLUX3_PREPARED " + json.dumps({"source_task_id": self.source_task, "at": time.time()}),
             flush=True,
         )
+
+    def warmup_expansion(self):
+        """Check the upsampler and expand one caption through it, returning the expansion."""
+        self.upsampler_health = self.upsampler.health.remote()
+        text = self.tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": "Two blue mugs on a wooden table by a window"},
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        reply = self.upsampler.expand.remote(
+            {
+                "path": "/v1/completions",
+                "json": {
+                    "model": "pup",
+                    "prompt": self.tokenizer.encode(text, add_special_tokens=False),
+                    **SAMPLING,
+                    "stop_token_ids": self.stop_tokens,
+                },
+            }
+        )
+        if reply["status"] != 200:
+            raise RuntimeError(f"Warmup prompt expansion failed at the upsampler: {reply['status']}")
+        answer = reply["result"]["choices"][0]
+        if answer.get("finish_reason") != "stop" or not answer.get("text", "").strip():
+            raise RuntimeError("Warmup prompt expansion did not complete")
+        return answer["text"].strip()
 
     def launch(self, name, command, env):
         self.processes[name] = subprocess.Popen(command, env=env, start_new_session=True)

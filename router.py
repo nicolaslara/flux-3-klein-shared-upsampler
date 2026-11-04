@@ -15,7 +15,7 @@ UPSAMPLER_APP = os.getenv("UPSAMPLER_APP", "flux3-upsampler")
 # model name -> worker app; a name that is not listed maps to flux3-klein-<name>-shared.
 WORKERS = dict(item.split("=", 1) for item in os.getenv("WORKERS", "").split(",") if item)
 DEADLINE = 900
-REGION = os.getenv("REGION") or None  # keep it in the workers' region: every hop is a round trip
+REGION = os.getenv("REGION") or None  # us-east, the routing region, keeps every hop short
 SAMPLING = dict(model="pup", temperature=0.0, top_p=0.95, top_k=20, min_p=0.0, max_tokens=3584)
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
