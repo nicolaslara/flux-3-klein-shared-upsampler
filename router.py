@@ -222,9 +222,6 @@ def create_api(runtime):
     target_concurrency=64,
     max_concurrency=64,
     startup_timeout=120,
-    routing_region="us-east",
-    # The routing region, where every worker URL is served; keeping the router there keeps the hops short.
-    compute_region="us-east",
     unauthenticated=False,
     secrets=[modal.Secret.from_name("flux3-router")],
 )

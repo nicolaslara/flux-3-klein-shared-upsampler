@@ -474,7 +474,6 @@ app = modal.App(APP_NAME)
     max_concurrency=MAX_INFLIGHT,
     scaledown_window=IDLE_SECONDS,
     startup_timeout=900,
-    routing_region="us-east",
     unauthenticated=False,
     # The source is in the image, so an unchanged redeploy keeps its memory snapshot.
     include_source=False,
