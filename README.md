@@ -52,7 +52,7 @@ uv run modal deploy upsampler.py
 uv run modal deploy worker.py
 ```
 
-The first deploys build the images (19 GB and 16 GB). The worker's build ends with a GPU step of about three minutes that runs the engine once and keeps its kernel caches. The worker's deploy prints its URL; export it with a proxy auth token from the Modal dashboard (Settings, Proxy Auth Tokens):
+The first deploys build the images (19 GB and 16 GB). Each build ends with a GPU step of a few minutes that starts its engine once and keeps the compiled graph and kernel caches. The worker's deploy prints its URL; export it with a proxy auth token from the Modal dashboard (Settings, Proxy Auth Tokens):
 
 ```
 export URL=https://<workspace>-<environment>--flux3-klein-distilled-shared-server.us-east.modal.direct
@@ -109,6 +109,8 @@ uv run modal run worker.py --warm 1
 
 A worker renders one picture at a time, lets the next request's encoding overlap it, and holds up to 16 requests. Beyond that Modal queues and adds workers, up to `REPLICAS`. One prompt upsampler fed three workers with headroom.
 
+The prompt upsampler stays up by default. With `WARM=0` it stops after 120 s idle as well and restores from its own snapshot in about 30 s, alongside the worker; a fresh start takes about two minutes.
+
 ## Configuration
 
 Environment variables read at deploy time, for example `MODEL=base REPLICAS=4 uv run modal deploy worker.py`. A redeploy with the same code and settings keeps the snapshot.
@@ -119,6 +121,10 @@ Environment variables read at deploy time, for example `MODEL=base REPLICAS=4 uv
 |---|---|---|
 | `GPU` | `B200` | H200 is $1.70 per hour cheaper and 0.4 s slower per expansion |
 | `APP_NAME` | `flux3-upsampler` | |
+| `WARM` | `1` | Prompt upsamplers kept up; `modal run upsampler.py --warm N` changes it without a redeploy |
+| `REPLICAS` | `1` | Most prompt upsamplers |
+| `IDLE_SECONDS` | `120` | How long an idle prompt upsampler stays up |
+| `SNAPSHOT` | `1` | `0` makes every start fresh |
 
 `worker.py`:
 
